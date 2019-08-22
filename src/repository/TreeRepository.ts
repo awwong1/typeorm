@@ -2,6 +2,7 @@ import {Repository} from "./Repository";
 import {SelectQueryBuilder} from "../query-builder/SelectQueryBuilder";
 import {ObjectLiteral} from "../common/ObjectLiteral";
 import {AbstractSqliteDriver} from "../driver/sqlite-abstract/AbstractSqliteDriver";
+import {QueryBuilder} from "../query-builder/QueryBuilder";
 
 /**
  * Repository with additional functions to work with trees.
@@ -236,11 +237,79 @@ export class TreeRepository<Entity> extends Repository<Entity> {
     }
 
     /**
-     * Moves entity to the children of then given entity.
-     *
-    move(entity: Entity, to: Entity): Promise<void> {
+     * Moves an entity to a given entity's children, or to root.
+     */
+    async move(entity: Entity, to: Entity | null): Promise<void> {
+        const moveQueries = await this.moveEntityQueriesBuilder("treeEntity", "treeClosure", entity, to);
+
+        await this.manager.transaction(async transactionManager => {
+            for (const moveQuery of moveQueries) {
+                moveQuery.setQueryRunner(transactionManager.queryRunner!);
+                await moveQuery.execute();
+            }
+            // update the entity relation to `to`
+            const joinColumn = this.metadata.treeParentRelation!.joinColumns[0];
+            joinColumn.setEntityValue(entity, to);
+            await transactionManager.save(entity);
+        });
         return Promise.resolve();
-    } */
+    }
+
+    async moveEntityQueriesBuilder(alias: string, closureTableAlias: string, entity: Entity, to: Entity|null): Promise<QueryBuilder<Entity|unknown>[]> {
+        const escape = (alias: string) => this.manager.connection.driver.escape(alias);
+        const entDescendants = await this.findDescendants(entity);
+        const toAncestors = to ? await this.findAncestors(to) : [];
+        // entity must be an ancestor of itself
+        toAncestors.push(entity);
+
+        if (this.metadata.treeType === "closure-table") {
+            // delete all ancestors -> entity + entity descendants closures
+            const delAncestorsParameters: ObjectLiteral = {};
+            const descendantWhereCondition = entDescendants.map(e => {
+                const eCondition = this.metadata.closureJunctionTable.descendantColumns.map(column => {
+                    const eVal = column.referencedColumn!.getEntityValue(e);
+                    const eKey = column.referencedColumn!.propertyName + eVal;
+                    delAncestorsParameters[eKey] = eVal;
+                    return escape(column.propertyPath) + ` = :${eKey}`;
+                }).join(" AND ");
+                return `(${eCondition})`;
+            }).join(" OR ");
+            const clearAncestorsQuery = this.createQueryBuilder()
+                .delete()
+                .from(this.metadata.closureJunctionTable.tableName)
+                .where(descendantWhereCondition)
+                .setParameters(delAncestorsParameters);
+
+            // All toAncestors must be made ancestors of entDescendants
+            const closuresToInsert = toAncestors.reduce<ObjectLiteral[]>((closures, ancestorEntity) => {
+                const ancestorPartial = this.metadata.closureJunctionTable.ancestorColumns.reduce<ObjectLiteral>(
+                    (prevPartial, column) => {
+                        const aKey = column.propertyPath;
+                        const aVal = column.referencedColumn!.getEntityValue(ancestorEntity);
+                        return { ...prevPartial, [aKey]: aVal };
+                    }, {});
+                const descendentPartials = entDescendants.map(descendantEntity => {
+                    const descendentPartial = this.metadata.closureJunctionTable.descendantColumns.reduce<ObjectLiteral>((prevPartial, column) => {
+                        const dKey = column.propertyPath;
+                        const dVal = column.referencedColumn!.getEntityValue(descendantEntity);
+                        return { ...prevPartial, [dKey]: dVal };
+                    }, {});
+                    return descendentPartial;
+                });
+                const newClosuresToInsert = descendentPartials.map(descendentPartial => ({ ...ancestorPartial, ...descendentPartial }));
+                return [...closures, ...newClosuresToInsert];
+            }, []);
+            // insert all toancestors -> entity + entity descendants closures
+
+            // TODO: Why are all closures to insert undefined in this query?
+            const insertAncestorsQuery = this.createQueryBuilder()
+                .insert()
+                .into(this.metadata.closureJunctionTable.tableName)
+                .values(closuresToInsert);
+            return [clearAncestorsQuery, insertAncestorsQuery];
+        }
+        return [];
+    }
 
     // -------------------------------------------------------------------------
     // Protected Methods
